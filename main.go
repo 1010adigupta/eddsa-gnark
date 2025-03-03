@@ -22,9 +22,9 @@ import (
 // Using frontend.Variable for all fields to be compatible with ExpanderCompilerCollection
 type EdDSACircuit struct {
 	// Public inputs
-	PublicKeyX frontend.Variable `gnark:",public"`
-	PublicKeyY frontend.Variable `gnark:",public"`
-	Message    frontend.Variable `gnark:",public"`
+	PublicKeyX frontend.Variable
+	PublicKeyY frontend.Variable
+	Message    frontend.Variable
 
 	// Private inputs (witnesses)
 	SignatureR_X frontend.Variable
