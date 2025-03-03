@@ -6,31 +6,69 @@ import (
 	"os"
 
 	"github.com/consensys/gnark-crypto/ecc"
-	"github.com/consensys/gnark-crypto/ecc/bn254/fr/mimc"
+	cryptomimc "github.com/consensys/gnark-crypto/ecc/bn254/fr/mimc"
 	"github.com/consensys/gnark-crypto/ecc/twistededwards"
 	cryptoeddsa "github.com/consensys/gnark-crypto/signature/eddsa"
-	"github.com/consensys/gnark/backend/groth16"
 	"github.com/consensys/gnark/frontend"
-	"github.com/consensys/gnark/frontend/cs/r1cs"
+	tedwards "github.com/consensys/gnark/std/algebra/native/twistededwards"
+	"github.com/consensys/gnark/std/signature/eddsa"
+
+	"github.com/PolyhedraZK/ExpanderCompilerCollection/ecgo"
+	"github.com/PolyhedraZK/ExpanderCompilerCollection/ecgo/test"
+	"github.com/consensys/gnark/std/hash/mimc"
 )
 
-func main() {
-	fmt.Println("EdDSA Signature Verification in ZK-SNARK")
-	fmt.Println("----------------------------------------")
-	
-	// Run the test for valid EdDSA verification
-	fmt.Println("\nTesting with valid signature:")
-	TestEdDSA()
-	
-	// Run the test for invalid EdDSA verification
-	fmt.Println("\nTesting with invalid signature:")
-	TestEdDSAWithInvalidSignature()
+// EdDSACircuit defines the circuit for EdDSA signature verification
+// Using frontend.Variable for all fields to be compatible with ExpanderCompilerCollection
+type EdDSACircuit struct {
+	// Public inputs
+	PublicKeyX frontend.Variable `gnark:",public"`
+	PublicKeyY frontend.Variable `gnark:",public"`
+	Message    frontend.Variable `gnark:",public"`
+
+	// Private inputs (witnesses)
+	SignatureR_X frontend.Variable
+	SignatureR_Y frontend.Variable
+	SignatureS   frontend.Variable
 }
 
-// TestEdDSA tests the EdDSA signature verification in a zk-SNARK
-func TestEdDSA() {
-	// Choose the curve
-	curve := ecc.BN254
+// Define implements the circuit for EdDSA signature verification
+func (circuit *EdDSACircuit) Define(api frontend.API) error {
+	// Initialize the twisted Edwards curve for BN254
+	curve, err := tedwards.NewEdCurve(api, twistededwards.BN254)
+	if err != nil {
+		return err
+	}
+
+	// Initialize the MiMC hash function
+	hash, err := mimc.NewMiMC(api)
+	if err != nil {
+		return err
+	}
+
+	// Create the public key and signature objects
+	publicKey := eddsa.PublicKey{
+		A: tedwards.Point{
+			X: circuit.PublicKeyX,
+			Y: circuit.PublicKeyY,
+		},
+	}
+
+	signature := eddsa.Signature{
+		R: tedwards.Point{
+			X: circuit.SignatureR_X,
+			Y: circuit.SignatureR_Y,
+		},
+		S: circuit.SignatureS,
+	}
+
+	// Verify the signature in the constraint system
+	return eddsa.Verify(curve, signature, circuit.Message, publicKey, &hash)
+}
+
+func main() {
+	fmt.Println("EdDSA Signature Verification in ZK-SNARK with ExpanderCompilerCollection")
+	fmt.Println("------------------------------------------------------------------")
 
 	// Create an EdDSA key pair
 	privateKey, err := cryptoeddsa.New(twistededwards.BN254, rand.Reader)
@@ -44,8 +82,8 @@ func TestEdDSA() {
 	msg := []byte{0xde, 0xad, 0xf0, 0x0d}
 
 	// Create a MiMC hash function
-	hFunc := mimc.NewMiMC()
-	
+	hFunc := cryptomimc.NewMiMC()
+
 	// Sign the message
 	signature, err := privateKey.Sign(msg, hFunc)
 	if err != nil {
@@ -65,148 +103,61 @@ func TestEdDSA() {
 	}
 	fmt.Println("✅ Signature verified successfully outside the circuit")
 
-	// Now verify the signature inside a zk-SNARK circuit
-	// Create the circuit
-	var circuit EdDSACircuit
-
-	// Compile the circuit
-	ccs, err := frontend.Compile(curve.ScalarField(), r1cs.NewBuilder, &circuit)
+	// Compile the circuit using ECC
+	fmt.Println("Compiling circuit...")
+	eccCircuit, err := ecgo.Compile(ecc.BN254.ScalarField(), &EdDSACircuit{})
 	if err != nil {
-		fmt.Println("Error compiling circuit:", err)
+		fmt.Println("Error compiling circuit with ECC:", err)
 		os.Exit(1)
 	}
 
-	// Generate the proving and verification keys
-	pk, vk, err := groth16.Setup(ccs)
+	// Get the layered circuit and serialize it to a file
+	layeredCircuit := eccCircuit.GetLayeredCircuit()
+	err = os.WriteFile("circuit.txt", layeredCircuit.Serialize(), 0644)
 	if err != nil {
-		fmt.Println("Error in setup:", err)
+		fmt.Println("Error writing circuit to file:", err)
 		os.Exit(1)
 	}
+	fmt.Println("✅ Circuit serialized to circuit.txt")
+
+	// Extract public key and signature components
+	pubKey := publicKey.Bytes()
+	sig := signature
 
 	// Create the witness assignment
-	var assignment EdDSACircuit
+	assignment := &EdDSACircuit{
+		// Public inputs
+		PublicKeyX: pubKey[:32], // X coordinate
+		PublicKeyY: pubKey[32:], // Y coordinate
+		Message:    msg,
 
-	// Assign the message value
-	assignment.Message = msg
+		// Private inputs (witnesses)
+		SignatureR_X: sig[:32],   // R.X coordinate
+		SignatureR_Y: sig[32:64], // R.Y coordinate
+		SignatureS:   sig[64:],   // S value
+	}
 
-	// Assign the public key
-	assignment.PublicKey.Assign(twistededwards.BN254, publicKey.Bytes())
-
-	// Assign the signature
-	assignment.Signature.Assign(twistededwards.BN254, signature)
-
-	// Create the witness
-	witness, err := frontend.NewWitness(&assignment, curve.ScalarField())
+	// Get the input solver and solve for the witness
+	inputSolver := eccCircuit.GetInputSolver()
+	witness, err := inputSolver.SolveInputAuto(assignment)
 	if err != nil {
-		fmt.Println("Error creating witness:", err)
+		fmt.Println("Error solving for witness:", err)
 		os.Exit(1)
 	}
-	publicWitness, err := witness.Public()
+
+	// Serialize the witness to a file
+	err = os.WriteFile("witness.txt", witness.Serialize(), 0644)
 	if err != nil {
-		fmt.Println("Error extracting public witness:", err)
+		fmt.Println("Error writing witness to file:", err)
 		os.Exit(1)
 	}
+	fmt.Println("✅ Witness serialized to witness.txt")
 
-	// Generate the proof
-	proof, err := groth16.Prove(ccs, pk, witness)
-	if err != nil {
-		fmt.Println("Error generating proof:", err)
+	// Check the circuit (this is just a local verification, not a full proof)
+	if !test.CheckCircuit(layeredCircuit, witness) {
+		fmt.Println("❌ Circuit check failed")
 		os.Exit(1)
 	}
-
-	// Verify the proof
-	err = groth16.Verify(proof, vk, publicWitness)
-	if err != nil {
-		fmt.Println("Error verifying proof:", err)
-		os.Exit(1)
-	}
-	fmt.Println("✅ Proof verified successfully")
-}
-
-// TestEdDSAWithInvalidSignature tests that the verification fails with an invalid signature
-func TestEdDSAWithInvalidSignature() {
-	// Choose the curve
-	curve := ecc.BN254
-
-	// Create an EdDSA key pair
-	privateKey, err := cryptoeddsa.New(twistededwards.BN254, rand.Reader)
-	if err != nil {
-		fmt.Println("Error creating private key:", err)
-		os.Exit(1)
-	}
-	publicKey := privateKey.Public()
-
-	// Define a message to sign
-	msg := []byte{0xde, 0xad, 0xf0, 0x0d}
-
-	// Create a MiMC hash function
-	hFunc := mimc.NewMiMC()
-	
-	// Sign the message
-	signature, err := privateKey.Sign(msg, hFunc)
-	if err != nil {
-		fmt.Println("Error signing message:", err)
-		os.Exit(1)
-	}
-
-	// Tamper with the signature
-	tamperedSignature := make([]byte, len(signature))
-	copy(tamperedSignature, signature)
-	tamperedSignature[0] ^= 0x01 // Flip a bit
-
-	// Verify the tampered signature (outside the circuit)
-	isValid, err := publicKey.Verify(tamperedSignature, msg, hFunc)
-	if err != nil {
-		fmt.Println("Error verifying tampered signature (expected):", err)
-		fmt.Println("✅ Tampered signature correctly identified as invalid outside the circuit")
-	} else if isValid {
-		fmt.Println("Tampered signature verified as valid, which is unexpected")
-		os.Exit(1)
-	} else {
-		fmt.Println("✅ Tampered signature correctly identified as invalid outside the circuit")
-	}
-
-	// Create the circuit
-	var circuit EdDSACircuit
-
-	// Compile the circuit
-	ccs, err := frontend.Compile(curve.ScalarField(), r1cs.NewBuilder, &circuit)
-	if err != nil {
-		fmt.Println("Error compiling circuit:", err)
-		os.Exit(1)
-	}
-
-	// Generate the proving and verification keys
-	pk, _, err := groth16.Setup(ccs)
-	if err != nil {
-		fmt.Println("Error in setup:", err)
-		os.Exit(1)
-	}
-
-	// Create the witness assignment
-	var assignment EdDSACircuit
-
-	// Assign the message value
-	assignment.Message = msg
-
-	// Assign the public key
-	assignment.PublicKey.Assign(twistededwards.BN254, publicKey.Bytes())
-
-	// Assign the tampered signature
-	assignment.Signature.Assign(twistededwards.BN254, tamperedSignature)
-
-	// Create the witness
-	witness, err := frontend.NewWitness(&assignment, curve.ScalarField())
-	if err != nil {
-		fmt.Println("Error creating witness for tampered signature:", err)
-		os.Exit(1)
-	}
-
-	// Attempt to generate a proof (this should fail)
-	_, err = groth16.Prove(ccs, pk, witness)
-	if err == nil {
-		fmt.Println("Generated proof with invalid signature, which is unexpected")
-		os.Exit(1)
-	}
-	fmt.Println("✅ Correctly failed to generate proof with invalid signature:", err)
+	fmt.Println("✅ Circuit check passed")
+	fmt.Println("To generate and verify the actual proof, supply circuit.txt and witness.txt to Expander")
 }

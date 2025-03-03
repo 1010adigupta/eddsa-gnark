@@ -5,9 +5,12 @@ go 1.22
 toolchain go1.23.4
 
 require (
+	github.com/PolyhedraZK/ExpanderCompilerCollection v1.0.0
 	github.com/consensys/gnark v0.12.0
 	github.com/consensys/gnark-crypto v0.16.0
 )
+
+replace github.com/PolyhedraZK/ExpanderCompilerCollection => github.com/PolyhedraZK/ExpanderCompilerCollection v1.0.0
 
 require (
 	github.com/bits-and-blooms/bitset v1.20.0 // indirect
